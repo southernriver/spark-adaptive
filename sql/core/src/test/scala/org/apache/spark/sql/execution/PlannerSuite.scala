@@ -18,21 +18,21 @@
 package org.apache.spark.sql.execution
 
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{execution, Row}
+import org.apache.spark.sql.{QueryTest, Row, execution}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.{Cross, FullOuter, Inner, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Repartition}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
-import org.apache.spark.sql.execution.exchange.{EnsureRequirements, ReusedExchangeExec, ReuseExchange, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.exchange.{EnsureRequirements, ReuseExchange, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types._
 
-class PlannerSuite extends SharedSQLContext {
+class PlannerSuite extends QueryTest with SharedSQLContext {
   import testImplicits._
 
   setupTestData()
@@ -312,6 +312,46 @@ class PlannerSuite extends SharedSQLContext {
     assertDistributionRequirementsAreSatisfied(outputPlan)
     if (outputPlan.collect { case e: ShuffleExchangeExec => true }.isEmpty) {
       fail(s"Exchange should have been added:\n$outputPlan")
+    }
+  }
+
+  test("EnsureRequirements with the initial partition number that" +
+    " is based on the statistics of leaf node") {
+    val distribution = ClusteredDistribution(Literal(1) :: Nil)
+    val childPartitioning = HashPartitioning(Literal(2) :: Nil, 1)
+
+    val inputPlan = DummySparkPlan(
+      children = Seq(
+        DummySparkPlan(outputPartitioning = childPartitioning),
+        DummySparkPlan(outputPartitioning = childPartitioning)
+      ),
+      requiredChildDistribution = Seq(distribution, distribution),
+      requiredChildOrdering = Seq(Seq.empty, Seq.empty)
+    )
+    withSQLConf(SQLConf.SHUFFLE_TARGET_POSTSHUFFLE_INPUT_SIZE.key -> "1") {
+
+      val totalInputFileSize = inputPlan.collectLeaves().map(_.stats.sizeInBytes).sum
+      val expectedNum = Math.ceil(
+        totalInputFileSize.toLong * 1.0 / conf.targetPostShuffleInputSize).toInt
+
+      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_AUTO_CALCULATE_INITIAL_PARTITION_NUM.key -> "true") {
+        val outputPlan = EnsureRequirements(spark.sessionState.conf).apply(inputPlan)
+        outputPlan.collect{
+          case plan : ShuffleExchangeExec =>
+            val realNum = plan.outputPartitioning.numPartitions
+            assert(realNum == expectedNum)
+        }
+      }
+
+      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        val outputPlan = EnsureRequirements(spark.sessionState.conf).apply(inputPlan)
+        outputPlan.collect{
+          case plan : ShuffleExchangeExec =>
+            val realNum = plan.outputPartitioning.numPartitions
+            assert(realNum != expectedNum)
+        }
+      }
     }
   }
 
@@ -604,6 +644,42 @@ class PlannerSuite extends SharedSQLContext {
       childPlan = DummySparkPlan(outputOrdering = Seq(orderingA)),
       requiredOrdering = Seq(orderingA, orderingB),
       shouldHaveSort = true)
+  }
+
+  test("EnsureRequirements doesn't add shuffle between 2 successive full outer joins on the same " +
+    "key") {
+    val df1 = spark.range(1, 100, 1, 2).filter(_ % 2 == 0).selectExpr("id as a1")
+    val df2 = spark.range(1, 100, 1, 2).selectExpr("id as b2")
+    val df3 = spark.range(1, 100, 1, 2).selectExpr("id as a3")
+    val fullOuterJoins = df1
+      .join(df2, col("a1") === col("b2"), "full_outer")
+        .join(df3, col("a1") === col("a3"), "full_outer")
+    assert(
+      fullOuterJoins.queryExecution.executedPlan.collect { case e: ShuffleExchangeExec => e }
+        .length === 3)
+    val expected = (1 until 100).filter(_ % 2 == 0).map(i => Row(i, i, i)) ++
+      (1 until 100).filterNot(_ % 2 == 0).map(Row(null, _, null)) ++
+        (1 until 100).filterNot(_ % 2 == 0).map(Row(null, null, _))
+    checkAnswer(fullOuterJoins, expected)
+  }
+
+  test("EnsureRequirements still adds shuffle for non-successive full outer joins on the same key")
+  {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "0") {
+      val df1 = spark.range(1, 100).selectExpr("id as a1")
+      val df2 = spark.range(1, 100).selectExpr("id as b2")
+      val df3 = spark.range(1, 100).selectExpr("id as a3")
+      val df4 = spark.range(1, 100).selectExpr("id as a4")
+
+      val fullOuterJoins = df1
+        .join(df2, col("a1") === col("b2"), "full_outer")
+          .join(df3, col("a1") === col("a3"), "left_outer")
+            .join(df4, col("a3") === col("a4"), "full_outer")
+      fullOuterJoins.explain(true)
+      assert(
+        fullOuterJoins.queryExecution.executedPlan.collect { case e: ShuffleExchangeExec => e }
+          .length === 5)
+    }
   }
 }
 

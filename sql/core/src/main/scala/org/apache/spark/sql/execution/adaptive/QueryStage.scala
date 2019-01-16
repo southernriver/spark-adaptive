@@ -24,7 +24,7 @@ import org.apache.spark.{broadcast, MapOutputStatistics, SparkContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.physical.Partitioning
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, PartitioningCollection}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.exchange._
 import org.apache.spark.sql.execution.ui.SparkListenerSQLAdaptiveExecutionUpdate
@@ -85,12 +85,18 @@ abstract class QueryStage extends UnaryExecNode {
       Future.sequence(shuffleStageFutures)(implicitly, QueryStage.executionContext), Duration.Inf)
   }
 
+  private var prepared = false
+
   /**
    * Before executing the plan in this query stage, we execute all child stages, optimize the plan
    * in this stage and determine the reducer number based on the child stages' statistics. Finally
    * we do a codegen for this query stage and update the UI with the new plan.
    */
-  def prepareExecuteStage(): Unit = {
+  def prepareExecuteStage(): Unit = synchronized {
+    // Ensure the prepareExecuteStage method only be executed once.
+    if (prepared) {
+      return
+    }
     // 1. Execute childStages
     executeChildStages()
 
@@ -109,7 +115,17 @@ abstract class QueryStage extends UnaryExecNode {
     }
     val childMapOutputStatistics = queryStageInputs.map(_.childStage.mapOutputStatistics)
       .filter(_ != null).toArray
-    if (childMapOutputStatistics.length > 0) {
+    // Right now, Adaptive execution only support HashPartitionings.
+    val supportAdaptive = queryStageInputs.forall{
+        _.outputPartitioning match {
+          case hash: HashPartitioning => true
+          case collection: PartitioningCollection =>
+            collection.partitionings.forall(_.isInstanceOf[HashPartitioning])
+          case _ => false
+        }
+    }
+
+    if (childMapOutputStatistics.length > 0 && supportAdaptive) {
       val exchangeCoordinator = new ExchangeCoordinator(
         conf.targetPostShuffleInputSize,
         conf.adaptiveTargetPostShuffleRowCount,
@@ -142,6 +158,7 @@ abstract class QueryStage extends UnaryExecNode {
         queryExecution.toString,
         SparkPlanInfo.fromSparkPlan(queryExecution.executedPlan)))
     }
+    prepared = true
   }
 
   // Caches the created ShuffleRowRDD so we can reuse that.
